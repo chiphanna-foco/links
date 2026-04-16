@@ -1,31 +1,43 @@
-"""OpenAI client — analyzes linked-conversation updates and returns a JSON decision.
+"""Anthropic client — analyzes linked-conversation updates and returns a JSON decision.
 
-The system prompt is preserved verbatim from the original Google Apps Script
-so behavior matches byte-for-byte.
+Uses Claude Haiku 4.5 via the official Anthropic Python SDK with structured
+outputs for guaranteed-valid JSON responses.
 """
 import json
 import logging
 
-import requests
+import anthropic
 
-from config import OPENAI_API_KEY, OPENAI_API_URL, OPENAI_MODEL
+from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 500
-TEMPERATURE = 0.3
+MAX_TOKENS = 2048
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant that analyzes conversation updates and creates "
-    "concise summaries. Always respond with valid JSON only, no markdown formatting."
+    "You are a helpful assistant that analyzes conversation updates and "
+    "creates concise summaries."
 )
+
+RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "shouldPost": {"type": "boolean"},
+            "reasoning": {"type": "string"},
+            "message": {"type": "string"},
+        },
+        "required": ["shouldPost", "reasoning", "message"],
+        "additionalProperties": False,
+    },
+}
 
 
 def _format_context(updates: list[dict]) -> str:
-    """Render the updates list in the same shape the Apps Script passed."""
     lines = [
-        "Analyze the following updates from linked Front conversations and determine "
-        "if they are significant enough to report.",
+        "Analyze the following updates from linked Front conversations and "
+        "determine if they are significant enough to report.",
         "",
     ]
     for update in updates:
@@ -82,56 +94,48 @@ Examples:
 
 
 Keep it SHORT but COMPREHENSIVE - capture all important updates in 1-2 sentences.
+Set `shouldPost` to false for insignificant updates; leave `message` empty in that case."""
 
 
-Respond in JSON format:
-{{
-  "shouldPost": true/false,
-  "reasoning": "brief explanation",
-  "message": "concise summary with linked subject and ALL key details in markdown format (if shouldPost is true)"
-}}"""
-
-
-class OpenAIClient:
+class AnthropicClient:
     def __init__(self):
-        self.api_url = OPENAI_API_URL
-        self.api_key = OPENAI_API_KEY
-        self.model = OPENAI_MODEL
+        if not ANTHROPIC_API_KEY:
+            self._client = None
+        else:
+            self._client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.model = ANTHROPIC_MODEL
 
     def analyze_updates(self, updates: list[dict]) -> dict:
         """Return {"shouldPost": bool, "reasoning": str, "message": str}.
 
-        On any failure returns shouldPost=False so the caller skips posting."""
-        if not self.api_key:
-            logger.error("OPENAI_API_KEY not configured")
+        On any failure, returns shouldPost=False so the caller skips posting.
+        """
+        if self._client is None:
+            logger.error("ANTHROPIC_API_KEY not configured")
             return {"shouldPost": False, "reasoning": "no_api_key", "message": ""}
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(updates)},
-            ],
-            "max_tokens": MAX_TOKENS,
-            "temperature": TEMPERATURE,
-            "response_format": {"type": "json_object"},
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
         try:
-            resp = requests.post(self.api_url, json=payload, headers=headers, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            result = json.loads(content)
-            logger.info(
-                "AI decision: shouldPost=%s reasoning=%s",
-                result.get("shouldPost"),
-                result.get("reasoning"),
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": _build_user_prompt(updates)}],
+                output_config={"format": RESPONSE_SCHEMA},
             )
-            return result
-        except Exception:
-            logger.exception("OpenAI analysis failed")
-            return {"shouldPost": False, "reasoning": "error", "message": ""}
+        except anthropic.APIError:
+            logger.exception("Anthropic API call failed")
+            return {"shouldPost": False, "reasoning": "api_error", "message": ""}
+
+        try:
+            text = next(b.text for b in response.content if b.type == "text")
+            result = json.loads(text)
+        except (StopIteration, json.JSONDecodeError):
+            logger.exception("Could not parse Anthropic response")
+            return {"shouldPost": False, "reasoning": "parse_error", "message": ""}
+
+        logger.info(
+            "AI decision: shouldPost=%s reasoning=%s",
+            result.get("shouldPost"),
+            result.get("reasoning"),
+        )
+        return result

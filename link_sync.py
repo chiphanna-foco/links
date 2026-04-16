@@ -2,7 +2,7 @@
 
 For each Front conversation tagged LINKED_TAG_ID, extract Front links referenced
 in its comments, check each linked conversation for new activity since we last
-looked, ask OpenAI to summarize, and post a `🔗 Linked Conversation Update`
+looked, ask Claude to summarize, and post a `🔗 Linked Conversation Update`
 comment back to the parent.
 """
 import logging
@@ -17,9 +17,9 @@ from database import (
     record_sync_run,
     upsert_last_checked,
 )
+from anthropic_client import AnthropicClient
 from front import FrontClient
 from html_utils import strip_html
-from openai_client import OpenAIClient
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def get_activity_since(
 
 def process_conversation(
     front: FrontClient,
-    openai: OpenAIClient,
+    claude: AnthropicClient,
     parent: dict,
     force: bool = False,
 ) -> tuple[int, int]:
@@ -192,7 +192,7 @@ def process_conversation(
                 "activity": activity,
             }
         ]
-        result = openai.analyze_updates(update_payload)
+        result = claude.analyze_updates(update_payload)
 
         if result.get("shouldPost") and result.get("message"):
             body = f"{COMMENT_PREFIX}\n\n{result['message']}"
@@ -226,7 +226,7 @@ def check_linked_conversations(force: bool = False) -> dict:
         return {"status": "error", "details": "LINKED_TAG_ID not configured"}
 
     front = FrontClient()
-    openai = OpenAIClient()
+    claude = AnthropicClient()
 
     try:
         parents = front.get_conversations_by_tag(LINKED_TAG_ID)
@@ -245,7 +245,7 @@ def check_linked_conversations(force: bool = False) -> dict:
     total_posts = 0
     for parent in parents:
         try:
-            links, posts = process_conversation(front, openai, parent, force=force)
+            links, posts = process_conversation(front, claude, parent, force=force)
             total_links += links
             total_posts += posts
         except Exception:
@@ -269,7 +269,7 @@ def check_linked_conversations(force: bool = False) -> dict:
 def process_single_conversation(conversation_id: str, force: bool = True) -> dict:
     """Test a single parent conversation (replaces Apps Script `testConversation`)."""
     front = FrontClient()
-    openai = OpenAIClient()
+    claude = AnthropicClient()
     started = time.monotonic()
 
     try:
@@ -279,7 +279,7 @@ def process_single_conversation(conversation_id: str, force: bool = True) -> dic
         return {"status": "error", "details": str(exc)}
 
     try:
-        links, posts = process_conversation(front, openai, parent, force=force)
+        links, posts = process_conversation(front, claude, parent, force=force)
     except Exception as exc:
         logger.exception("Failed processing %s", conversation_id)
         return {"status": "error", "details": str(exc)}

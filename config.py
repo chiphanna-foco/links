@@ -8,10 +8,9 @@ FRONT_API_KEY = os.getenv("FRONT_API_KEY", "")
 FRONT_API_URL = os.getenv("FRONT_API_URL", "https://api2.frontapp.com")
 LINKED_TAG_ID = os.getenv("LINKED_TAG_ID", "")
 
-# -- OpenAI --
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+# -- Anthropic --
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 
 # -- Scheduler --
 CHECK_INTERVAL_HOURS = int(os.getenv("CHECK_INTERVAL_HOURS", "6"))
