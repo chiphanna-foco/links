@@ -226,30 +226,54 @@ def _format_dated_bullet(text: str, date_str: str) -> str:
     return f"{date_str} — {text}"
 
 
+def _parse_md(s: str) -> Optional[tuple[int, int]]:
+    """Parse 'M/D', 'MM/DD', or 'M/D/YY' into (month, day). Returns None on bad input."""
+    if not s:
+        return None
+    try:
+        parts = s.strip().split("/")
+        if len(parts) < 2:
+            return None
+        m = int(parts[0])
+        d = int(parts[1])
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            return (m, d)
+    except (ValueError, AttributeError):
+        return None
+    return None
+
+
 def _build_dated_bullets(
     bullets: list[dict], activity: list[dict]
-) -> list[str]:
+) -> tuple[list[str], list[dict]]:
     """Convert Claude's [{date,text}, ...] into dated-bullet strings.
 
-    - Drops bullets whose date doesn't match any activity timestamp (anti-hallucination).
+    - Drops bullets whose date doesn't match any activity (month, day).
     - Preserves Claude's order (which the prompt instructs to be chronological).
+    Returns (kept, dropped) where dropped is for diagnostics.
     """
-    valid_dates = {
-        f"{a['timestamp'].month}/{a['timestamp'].day}"
+    valid_md = {
+        (a["timestamp"].month, a["timestamp"].day)
         for a in activity
         if a.get("timestamp")
     }
-    out: list[str] = []
+    kept: list[str] = []
+    dropped: list[dict] = []
     for b in bullets:
         date = (b.get("date") or "").strip()
         text = (b.get("text") or "").strip()
         if not date or not text:
+            dropped.append({"reason": "empty", "bullet": b})
             continue
-        if date not in valid_dates:
+        md = _parse_md(date)
+        if md is None or md not in valid_md:
+            dropped.append({"reason": "bad_date", "bullet": b, "valid_dates": sorted(f"{m}/{d}" for m, d in valid_md)})
             logger.warning("Dropping bullet with invalid date %r: %r", date, text)
             continue
-        out.append(_format_dated_bullet(text, date))
-    return out
+        # Normalize to "M/D" (no zero-padding) regardless of how Claude formatted it.
+        canonical = f"{md[0]}/{md[1]}"
+        kept.append(_format_dated_bullet(text, canonical))
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -262,11 +286,13 @@ def process_conversation(
     parent: dict,
     force: bool = False,
     backfill: bool = False,
-) -> tuple[int, int]:
-    """Process a single parent conversation. Returns (links_checked, bullets_added).
+    debug: bool = False,
+) -> tuple[int, int, list[dict]]:
+    """Process a single parent conversation. Returns (links_checked, bullets_added, debug_info).
 
     backfill=True: ignore cache, look back to link_added_at, REPLACE each
     section's bullets with a freshly-generated set covering full history.
+    debug=True: collect per-link diagnostic info (always-empty when False).
     """
     parent_id = parent["id"]
     logger.info(
@@ -276,9 +302,10 @@ def process_conversation(
 
     comments = front.get_comments(parent_id)
     links = extract_links_from_comments(comments, self_id=parent_id)
+    debug_info: list[dict] = []
     if not links:
         logger.info("No Front links found in comments for %s", parent_id)
-        return 0, 0
+        return 0, 0, debug_info
 
     logger.info("Found %d linked conversation(s) for %s", len(links), parent_id)
 
@@ -359,8 +386,22 @@ def process_conversation(
         ]
         result = claude.analyze_updates(update_payload, previous_bullets=previous_bullets)
 
-        dated = _build_dated_bullets(result.get("bullets") or [], activity)
+        raw_bullets = result.get("bullets") or []
+        dated, dropped = _build_dated_bullets(raw_bullets, activity)
         latest = max(a["timestamp"] for a in activity)
+
+        if debug:
+            debug_info.append({
+                "linked_id": linked_id,
+                "subject": subject,
+                "since": since.isoformat(),
+                "activity_count": len(activity),
+                "shouldPost": result.get("shouldPost"),
+                "reasoning": result.get("reasoning"),
+                "raw_bullets": raw_bullets,
+                "kept_bullets": dated,
+                "dropped_bullets": dropped,
+            })
 
         if result.get("shouldPost") and dated:
             if backfill:
@@ -391,12 +432,12 @@ def process_conversation(
                 if linked_id in advanced_ids:
                     continue
                 upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
-            return links_checked, 0
+            return links_checked, 0, debug_info
 
     for linked_id, checked_at, posted_at in pending_cache_updates:
         upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
 
-    return links_checked, bullets_added
+    return links_checked, bullets_added, debug_info
 
 
 def check_linked_conversations(force: bool = False) -> dict:
@@ -429,7 +470,7 @@ def check_linked_conversations(force: bool = False) -> dict:
     total_posts = 0
     for parent in parents:
         try:
-            links, posts = process_conversation(front, claude, parent, force=force)
+            links, posts, _ = process_conversation(front, claude, parent, force=force)
             total_links += links
             total_posts += posts
         except Exception:
@@ -451,7 +492,10 @@ def check_linked_conversations(force: bool = False) -> dict:
 
 
 def process_single_conversation(
-    conversation_id: str, force: bool = True, backfill: bool = False
+    conversation_id: str,
+    force: bool = True,
+    backfill: bool = False,
+    debug: bool = False,
 ) -> dict:
     """Test a single parent conversation (replaces Apps Script `testConversation`)."""
     front = FrontClient()
@@ -465,15 +509,15 @@ def process_single_conversation(
         return {"status": "error", "details": str(exc)}
 
     try:
-        links, posts = process_conversation(
-            front, claude, parent, force=force, backfill=backfill
+        links, posts, dbg = process_conversation(
+            front, claude, parent, force=force, backfill=backfill, debug=debug
         )
     except Exception as exc:
         logger.exception("Failed processing %s", conversation_id)
         return {"status": "error", "details": str(exc)}
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    return {
+    out = {
         "status": "ok",
         "conversation_id": conversation_id,
         "links_checked": links,
@@ -481,3 +525,6 @@ def process_single_conversation(
         "backfill": backfill,
         "duration_ms": duration_ms,
     }
+    if debug:
+        out["debug"] = dbg
+    return out

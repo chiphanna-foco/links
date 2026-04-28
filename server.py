@@ -127,13 +127,17 @@ async def api_check():
 
 
 @app.post("/api/check/{conversation_id}")
-async def api_check_one(conversation_id: str, backfill: bool = False):
+async def api_check_one(
+    conversation_id: str, backfill: bool = False, debug: bool = False
+):
     """Force-check a single parent conversation.
 
     backfill=true ignores cache, looks back to when each link was added, and
     REPLACES the section's bullets with a freshly-generated history.
+    debug=true returns per-link diagnostics (AI reasoning, raw bullets,
+    dropped bullets) without changing behavior.
     """
     result = await asyncio.to_thread(
-        process_single_conversation, conversation_id, True, backfill
+        process_single_conversation, conversation_id, True, backfill, debug
     )
     return result
