@@ -2,8 +2,8 @@
 
 For each Front conversation tagged LINKED_TAG_ID, extract Front links referenced
 in its comments, check each linked conversation for new activity since we last
-looked, ask Claude to summarize, and post a `🔗 Linked Conversation Update`
-comment back to the parent.
+looked, ask Claude to summarize, and upsert a single pinned `🔗 Linked
+Conversation Updates` master comment on the parent.
 """
 import logging
 import re
@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 LINK_RE = re.compile(r"https://app\.frontapp\.com/open/(cnv_[a-zA-Z0-9]+)")
 COMMENT_PREFIX = "🔗 **Linked Conversation Update**"
+MASTER_PREFIX = "🔗 **Linked Conversation Updates**"
+SECTION_HEADING_RE = re.compile(
+    r"^### \[(?P<heading>.+?)\]\(https://app\.frontapp\.com/open/(?P<cnv_id>cnv_[a-zA-Z0-9]+)\)\s*$"
+)
 FORCE_LOOKBACK = timedelta(hours=2)
 
 
@@ -78,8 +82,8 @@ def get_activity_since(
 ) -> list[dict]:
     """Return message+comment updates with created_at > since_dt.
 
-    Skips comments that start with COMMENT_PREFIX (our own summaries) as a
-    defensive measure. Message bodies have HTML stripped.
+    Skips comments that look like our own summaries (legacy per-update comments
+    or the new master comment) so we never re-summarize ourselves.
     """
     updates: list[dict] = []
 
@@ -101,7 +105,7 @@ def get_activity_since(
 
     for c in front.get_comments(convo_id):
         body = c.get("body") or ""
-        if body.startswith(COMMENT_PREFIX):
+        if body.startswith(COMMENT_PREFIX) or body.startswith(MASTER_PREFIX):
             continue
         posted = _epoch_to_dt(c.get("posted_at"))
         if not posted or posted <= since_dt:
@@ -120,6 +124,95 @@ def get_activity_since(
 
 
 # ---------------------------------------------------------------------------
+# Master comment find / parse / serialize
+# ---------------------------------------------------------------------------
+
+def _find_master_comment(comments: list[dict]) -> Optional[dict]:
+    """Return the pinned master comment if present.
+
+    If multiple match, log a warning and return the oldest (smallest posted_at)
+    so subsequent runs converge on a single canonical comment.
+    """
+    matches = [
+        c for c in comments
+        if c.get("is_pinned") is True
+        and (c.get("body") or "").startswith(MASTER_PREFIX)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            "Found %d pinned master comments; using oldest", len(matches)
+        )
+        matches.sort(key=lambda c: c.get("posted_at") or 0)
+    return matches[0]
+
+
+def _parse_master_body(body: str) -> list[dict]:
+    """Parse a master-comment body into ordered sections.
+
+    Each section: {cnv_id, heading, bullets: [str, ...]}. Lines that don't fit
+    the heading/bullet shape are preserved as `extra` on the current section
+    (or dropped if before any heading) so manual edits inside a section round-trip.
+    """
+    sections: list[dict] = []
+    current: Optional[dict] = None
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        m = SECTION_HEADING_RE.match(line)
+        if m:
+            current = {
+                "cnv_id": m.group("cnv_id"),
+                "heading": m.group("heading"),
+                "bullets": [],
+            }
+            sections.append(current)
+            continue
+        if current is None:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            current["bullets"].append(stripped[2:])
+    return sections
+
+
+def _serialize_master_body(sections: list[dict]) -> str:
+    parts: list[str] = [MASTER_PREFIX, ""]
+    for i, s in enumerate(sections):
+        url = f"https://app.frontapp.com/open/{s['cnv_id']}"
+        parts.append(f"### [{s['heading']}]({url})")
+        for bullet in s["bullets"]:
+            parts.append(f"- {bullet}")
+        if i != len(sections) - 1:
+            parts.append("")
+    return "\n".join(parts)
+
+
+def _upsert_section(
+    sections: list[dict], cnv_id: str, heading_text: str, dated_bullet: str
+) -> list[dict]:
+    """Append `dated_bullet` to the section for cnv_id (creating it if needed).
+
+    Also refreshes the heading text on existing sections so subject renames
+    flow through. Mutates and returns `sections`.
+    """
+    for s in sections:
+        if s["cnv_id"] == cnv_id:
+            s["heading"] = heading_text
+            s["bullets"].append(dated_bullet)
+            return sections
+    sections.append(
+        {"cnv_id": cnv_id, "heading": heading_text, "bullets": [dated_bullet]}
+    )
+    return sections
+
+
+def _format_dated_bullet(bullet: str, when: datetime) -> str:
+    local = when.astimezone(timezone.utc)
+    return f"{local.month}/{local.day} — {bullet}"
+
+
+# ---------------------------------------------------------------------------
 # Core flow
 # ---------------------------------------------------------------------------
 
@@ -129,7 +222,7 @@ def process_conversation(
     parent: dict,
     force: bool = False,
 ) -> tuple[int, int]:
-    """Process a single parent conversation. Returns (links_checked, comments_posted)."""
+    """Process a single parent conversation. Returns (links_checked, bullets_added)."""
     parent_id = parent["id"]
     logger.info("Processing conversation %s", parent_id)
 
@@ -141,8 +234,22 @@ def process_conversation(
 
     logger.info("Found %d linked conversation(s) for %s", len(links), parent_id)
 
+    master = _find_master_comment(comments)
+    if master:
+        try:
+            sections = _parse_master_body(master.get("body") or "")
+        except Exception:
+            logger.exception(
+                "Failed to parse existing master comment %s; appending without merge",
+                master.get("id"),
+            )
+            sections = []
+    else:
+        sections = []
+
     links_checked = 0
-    comments_posted = 0
+    bullets_added = 0
+    pending_cache_updates: list[tuple[str, datetime, Optional[datetime]]] = []
     now = datetime.now(tz=timezone.utc)
 
     for link in links:
@@ -156,7 +263,6 @@ def process_conversation(
             since = last_checked
 
         if force:
-            # Apps Script test-mode: check back 2h, but respect cache if newer
             two_h_ago = now - FORCE_LOOKBACK
             if since < two_h_ago:
                 since = two_h_ago
@@ -174,16 +280,20 @@ def process_conversation(
 
         if not activity:
             logger.info("No new activity in %s", linked_id)
-            upsert_last_checked(parent_id, linked_id, now)
+            pending_cache_updates.append((linked_id, now, None))
             continue
 
-        # Fetch subject for the summary prompt
         try:
             linked_convo = front.get_conversation(linked_id)
             subject = linked_convo.get("subject") or "Linked conversation"
         except Exception:
             logger.exception("Could not fetch subject for %s", linked_id)
             subject = "Linked conversation"
+
+        existing_section = next(
+            (s for s in sections if s["cnv_id"] == linked_id), None
+        )
+        previous_bullets = list(existing_section["bullets"]) if existing_section else []
 
         update_payload = [
             {
@@ -192,27 +302,42 @@ def process_conversation(
                 "activity": activity,
             }
         ]
-        result = claude.analyze_updates(update_payload)
+        result = claude.analyze_updates(update_payload, previous_bullets=previous_bullets)
 
-        if result.get("shouldPost") and result.get("message"):
-            body = f"{COMMENT_PREFIX}\n\n{result['message']}"
-            try:
-                front.post_comment(parent_id, body)
-                comments_posted += 1
-            except Exception:
-                logger.exception("Failed posting comment to %s", parent_id)
-                # Don't advance cache — retry next run
-                continue
-
-            # Advance cache to the latest activity timestamp we reported,
-            # matching the Apps Script's updateLastCheckedTimeWithTimestamp.
+        if result.get("shouldPost") and result.get("bullet"):
             latest = max(a["timestamp"] for a in activity)
-            upsert_last_checked(parent_id, linked_id, latest, last_posted_at=now)
+            dated = _format_dated_bullet(result["bullet"].strip(), latest)
+            _upsert_section(sections, linked_id, subject, dated)
+            bullets_added += 1
+            pending_cache_updates.append((linked_id, latest, now))
         else:
             logger.info("AI decided not to post for %s", linked_id)
-            upsert_last_checked(parent_id, linked_id, now)
+            pending_cache_updates.append((linked_id, now, None))
 
-    return links_checked, comments_posted
+    if bullets_added > 0:
+        new_body = _serialize_master_body(sections)
+        try:
+            if master:
+                front.patch_comment(master["id"], new_body)
+            else:
+                front.post_comment(parent_id, new_body, is_pinned=True)
+        except Exception:
+            logger.exception("Failed to upsert master comment on %s", parent_id)
+            # Don't advance any cache rows for pairs we just appended bullets
+            # for — they'll retry next run.
+            advanced_ids = {
+                pid for (pid, _, posted) in pending_cache_updates if posted is not None
+            }
+            for linked_id, checked_at, posted_at in pending_cache_updates:
+                if linked_id in advanced_ids:
+                    continue
+                upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
+            return links_checked, 0
+
+    for linked_id, checked_at, posted_at in pending_cache_updates:
+        upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
+
+    return links_checked, bullets_added
 
 
 def check_linked_conversations(force: bool = False) -> dict:

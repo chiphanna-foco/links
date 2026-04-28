@@ -12,11 +12,24 @@ from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 2048
+MAX_TOKENS = 1024
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant that analyzes conversation updates and "
-    "creates concise summaries."
+    "You write extremely short status bullets for a property-management "
+    "operations log. Each bullet appears under a heading that already names "
+    "the linked conversation, so the bullet itself must NOT restate the "
+    "subject or property. Aim for 30-60 characters; hard cap 80. Lead with "
+    "the actor (Owner, Vendor, Manager, Tenant, etc.) or the action. No "
+    "filler phrases like 'Update:', 'FYI', 'Just letting you know'. No "
+    "leading dash or date — those are added by the caller. Return JSON "
+    "only.\n\n"
+    "Examples of the target style:\n"
+    "- Owner has approved a vendor\n"
+    "- Vendor has scheduled appointment\n"
+    "- Repairs is following up for invoice\n"
+    "- Milestone bid $1,235 received; 72hr deadline\n"
+    "- Three estimates in; owner selection needed\n"
+    "- Tenant declined first time slot; rescheduling"
 )
 
 RESPONSE_SCHEMA = {
@@ -26,25 +39,29 @@ RESPONSE_SCHEMA = {
         "properties": {
             "shouldPost": {"type": "boolean"},
             "reasoning": {"type": "string"},
-            "message": {"type": "string"},
+            "bullet": {"type": "string"},
         },
-        "required": ["shouldPost", "reasoning", "message"],
+        "required": ["shouldPost", "reasoning", "bullet"],
         "additionalProperties": False,
     },
 }
 
 
-def _format_context(updates: list[dict]) -> str:
+def _format_context(updates: list[dict], previous_bullets: list[str]) -> str:
     lines = [
-        "Analyze the following updates from linked Front conversations and "
-        "determine if they are significant enough to report.",
+        "Summarize the new activity from a linked conversation into ONE "
+        "short bullet for the operations log.",
         "",
     ]
+    if previous_bullets:
+        lines.append("Bullets ALREADY logged for this linked thread (do not repeat these facts):")
+        for b in previous_bullets:
+            lines.append(f"- {b}")
+        lines.append("")
+
     for update in updates:
         subject = update.get("conversation_subject") or "Linked conversation"
-        convo_id = update.get("conversation_id", "")
-        lines.append(f"\n## Linked Conversation: {subject}")
-        lines.append(f"Link: https://app.frontapp.com/open/{convo_id}\n")
+        lines.append(f"## New activity in: {subject}")
         for item in update.get("activity", []):
             if item["type"] == "message":
                 direction = "Inbound" if item.get("is_inbound") else "Outbound"
@@ -52,49 +69,29 @@ def _format_context(updates: list[dict]) -> str:
                 lines.append(f"- [{direction} Message] From: {author}")
                 if item.get("subject"):
                     lines.append(f"  Subject: {item['subject']}")
-                lines.append(f"  {item.get('body', '')}\n")
+                lines.append(f"  {item.get('body', '')}")
             else:
                 author = item.get("author") or "Unknown"
-                lines.append(f"- [Internal Comment] {author}: {item.get('body', '')}\n")
+                lines.append(f"- [Internal Comment] {author}: {item.get('body', '')}")
+        lines.append("")
     return "\n".join(lines)
 
 
-def _build_user_prompt(updates: list[dict]) -> str:
-    context = _format_context(updates)
+def _build_user_prompt(updates: list[dict], previous_bullets: list[str]) -> str:
+    context = _format_context(updates, previous_bullets)
     return f"""{context}
 
+TASK: Produce ONE bullet capturing the most decision-relevant new fact.
 
-TASK: Determine if these updates are significant enough to notify the main conversation. Consider:
-- Customer replies or new questions (HIGH priority)
-- Status changes or resolutions (HIGH priority)
-- Important internal decisions or updates (MEDIUM priority)
-- Minor administrative messages (LOW priority - skip)
+Rules:
+- Hard cap 80 characters; aim for 30-60.
+- Do NOT restate the conversation subject or property — the heading already shows it.
+- Lead with the actor (Owner, Vendor, Manager, Tenant) or the action.
+- Include concrete specifics that drive a decision (dollar amounts, deadlines, dates) when present, but cut detail before going long.
+- One sentence. No leading dash or date.
+- Set shouldPost=false if the activity is not materially new (automated bounce, duplicate of a logged bullet, status ping with no new fact). Leave bullet empty in that case.
 
-
-Review ALL the activity listed above and summarize ALL significant items together in ONE concise message.
-
-
-If significant, write a VERY CONCISE summary using this format:
-[Conversation Subject](https://app.frontapp.com/open/CONVERSATION_ID): Summarize all key updates in 1-2 sentences.
-
-
-IMPORTANT DETAILS TO INCLUDE:
-- Dates and times (e.g., "scheduled for Monday 4/20 at 8 AM")
-- Specific decisions or changes (e.g., "changed mind", "approved", "declined")
-- Action items or next steps
-- Any dollar amounts or quantities
-
-
-Make the conversation subject a clickable markdown link using the conversation ID provided above.
-
-
-Examples:
-- "[General Repairs Job #65840](https://app.frontapp.com/open/cnv_abc123): Owner initially requested hold, then changed mind. Now scheduled for Monday 4/20 at 8 AM."
-- "[Billing Question - Acme Corp](https://app.frontapp.com/open/cnv_def456): Customer replied requesting $500 refund. Support approved and processed payment."
-
-
-Keep it SHORT but COMPREHENSIVE - capture all important updates in 1-2 sentences.
-Set `shouldPost` to false for insignificant updates; leave `message` empty in that case."""
+Output JSON: {{"shouldPost": bool, "reasoning": str, "bullet": str}}"""
 
 
 class AnthropicClient:
@@ -105,33 +102,42 @@ class AnthropicClient:
             self._client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.model = ANTHROPIC_MODEL
 
-    def analyze_updates(self, updates: list[dict]) -> dict:
-        """Return {"shouldPost": bool, "reasoning": str, "message": str}.
+    def analyze_updates(
+        self,
+        updates: list[dict],
+        previous_bullets: list[str] | None = None,
+    ) -> dict:
+        """Return {"shouldPost": bool, "reasoning": str, "bullet": str}.
 
         On any failure, returns shouldPost=False so the caller skips posting.
         """
         if self._client is None:
             logger.error("ANTHROPIC_API_KEY not configured")
-            return {"shouldPost": False, "reasoning": "no_api_key", "message": ""}
+            return {"shouldPost": False, "reasoning": "no_api_key", "bullet": ""}
 
         try:
             response = self._client.messages.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": _build_user_prompt(updates)}],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": _build_user_prompt(updates, previous_bullets or []),
+                    }
+                ],
                 output_config={"format": RESPONSE_SCHEMA},
             )
         except anthropic.APIError:
             logger.exception("Anthropic API call failed")
-            return {"shouldPost": False, "reasoning": "api_error", "message": ""}
+            return {"shouldPost": False, "reasoning": "api_error", "bullet": ""}
 
         try:
             text = next(b.text for b in response.content if b.type == "text")
             result = json.loads(text)
         except (StopIteration, json.JSONDecodeError):
             logger.exception("Could not parse Anthropic response")
-            return {"shouldPost": False, "reasoning": "parse_error", "message": ""}
+            return {"shouldPost": False, "reasoning": "parse_error", "bullet": ""}
 
         logger.info(
             "AI decision: shouldPost=%s reasoning=%s",

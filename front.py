@@ -1,6 +1,6 @@
 """Front API client — tagged conversations, messages, comments, post comment."""
 import logging
-from typing import Iterator
+from typing import Iterator, Optional
 
 import requests
 
@@ -60,11 +60,34 @@ class FrontClient:
 
     # ------------------------------------------------------------------ write
 
-    def post_comment(self, conversation_id: str, body: str) -> dict:
+    def post_comment(
+        self, conversation_id: str, body: str, is_pinned: bool = False
+    ) -> dict:
         url = f"{self.api_url}/conversations/{conversation_id}/comments"
+        payload: dict = {"body": body}
+        if is_pinned:
+            payload["is_pinned"] = True
         resp = requests.post(
-            url, json={"body": body}, headers=self._headers(), timeout=15
+            url, json=payload, headers=self._headers(), timeout=15
         )
         resp.raise_for_status()
-        logger.info("Posted comment to %s", conversation_id)
+        logger.info(
+            "Posted comment to %s (pinned=%s)", conversation_id, is_pinned
+        )
+        return resp.json()
+
+    def patch_comment(
+        self, comment_id: str, body: str, is_pinned: Optional[bool] = None
+    ) -> dict:
+        url = f"{self.api_url}/comments/{comment_id}"
+        payload: dict = {"body": body}
+        if is_pinned is not None:
+            payload["is_pinned"] = is_pinned
+        resp = requests.patch(
+            url, json=payload, headers=self._headers(), timeout=15
+        )
+        resp.raise_for_status()
+        logger.info("Patched comment %s", comment_id)
+        if resp.status_code == 204 or not resp.content:
+            return {"id": comment_id}
         return resp.json()
