@@ -12,7 +12,8 @@ from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 1024
+MAX_TOKENS = 2048
+MAX_BULLETS = 8
 
 SYSTEM_PROMPT = (
     "You write extremely short status bullets for a property-management "
@@ -21,8 +22,8 @@ SYSTEM_PROMPT = (
     "subject or property. Aim for 30-60 characters; hard cap 80. Lead with "
     "the actor (Owner, Vendor, Manager, Tenant, etc.) or the action. No "
     "filler phrases like 'Update:', 'FYI', 'Just letting you know'. No "
-    "leading dash or date — those are added by the caller. Return JSON "
-    "only.\n\n"
+    "leading dash or date in the text — those are stored separately. Return "
+    "JSON only.\n\n"
     "Examples of the target style:\n"
     "- Owner has approved a vendor\n"
     "- Vendor has scheduled appointment\n"
@@ -39,40 +40,58 @@ RESPONSE_SCHEMA = {
         "properties": {
             "shouldPost": {"type": "boolean"},
             "reasoning": {"type": "string"},
-            "bullet": {"type": "string"},
+            "bullets": {
+                "type": "array",
+                "maxItems": MAX_BULLETS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["date", "text"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["shouldPost", "reasoning", "bullet"],
+        "required": ["shouldPost", "reasoning", "bullets"],
         "additionalProperties": False,
     },
 }
 
 
+def _format_activity_item(item: dict) -> list[str]:
+    ts = item.get("timestamp")
+    date_str = f"{ts.month}/{ts.day}" if ts else "?"
+    if item["type"] == "message":
+        direction = "Inbound" if item.get("is_inbound") else "Outbound"
+        author = item.get("author") or "Unknown"
+        lines = [f"- [{date_str}] [{direction} Message] From: {author}"]
+        if item.get("subject"):
+            lines.append(f"  Subject: {item['subject']}")
+        lines.append(f"  {item.get('body', '')}")
+        return lines
+    author = item.get("author") or "Unknown"
+    return [f"- [{date_str}] [Internal Comment] {author}: {item.get('body', '')}"]
+
+
 def _format_context(updates: list[dict], previous_bullets: list[str]) -> str:
     lines = [
-        "Summarize the new activity from a linked conversation into ONE "
-        "short bullet for the operations log.",
+        "Summarize the activity from a linked conversation into short bullets "
+        "for the operations log.",
         "",
     ]
     if previous_bullets:
-        lines.append("Bullets ALREADY logged for this linked thread (do not repeat these facts):")
+        lines.append("Bullets ALREADY logged (do NOT repeat these facts):")
         for b in previous_bullets:
             lines.append(f"- {b}")
         lines.append("")
 
     for update in updates:
         subject = update.get("conversation_subject") or "Linked conversation"
-        lines.append(f"## New activity in: {subject}")
+        lines.append(f"## Activity in: {subject}")
         for item in update.get("activity", []):
-            if item["type"] == "message":
-                direction = "Inbound" if item.get("is_inbound") else "Outbound"
-                author = item.get("author") or "Unknown"
-                lines.append(f"- [{direction} Message] From: {author}")
-                if item.get("subject"):
-                    lines.append(f"  Subject: {item['subject']}")
-                lines.append(f"  {item.get('body', '')}")
-            else:
-                author = item.get("author") or "Unknown"
-                lines.append(f"- [Internal Comment] {author}: {item.get('body', '')}")
+            lines.extend(_format_activity_item(item))
         lines.append("")
     return "\n".join(lines)
 
@@ -81,17 +100,20 @@ def _build_user_prompt(updates: list[dict], previous_bullets: list[str]) -> str:
     context = _format_context(updates, previous_bullets)
     return f"""{context}
 
-TASK: Produce ONE bullet capturing the most decision-relevant new fact.
+TASK: Produce up to {MAX_BULLETS} short bullets capturing the distinct decision-relevant beats of this thread.
 
 Rules:
-- Hard cap 80 characters; aim for 30-60.
+- Each bullet covers ONE distinct event or milestone (vendor scheduled, bid received, owner approval, follow-up sent, etc.).
+- Hard cap 80 characters per bullet text; aim 30-60.
 - Do NOT restate the conversation subject or property — the heading already shows it.
 - Lead with the actor (Owner, Vendor, Manager, Tenant) or the action.
-- Include concrete specifics that drive a decision (dollar amounts, deadlines, dates) when present, but cut detail before going long.
-- One sentence. No leading dash or date.
-- Set shouldPost=false if the activity is not materially new (automated bounce, duplicate of a logged bullet, status ping with no new fact). Leave bullet empty in that case.
+- The "date" field MUST be in M/D format and MUST match an actual activity date shown above (in the [M/D] tags). Do not invent dates.
+- One sentence per bullet, no leading dash or date inside the text.
+- Order bullets chronologically (oldest first).
+- Skip insignificant pings, automated bounces, and anything already covered by the "already logged" bullets above.
+- If nothing new is worth posting, return shouldPost=false and bullets=[].
 
-Output JSON: {{"shouldPost": bool, "reasoning": str, "bullet": str}}"""
+Output JSON: {{"shouldPost": bool, "reasoning": str, "bullets": [{{"date": "M/D", "text": str}}, ...]}}"""
 
 
 class AnthropicClient:
@@ -107,13 +129,14 @@ class AnthropicClient:
         updates: list[dict],
         previous_bullets: list[str] | None = None,
     ) -> dict:
-        """Return {"shouldPost": bool, "reasoning": str, "bullet": str}.
+        """Return {"shouldPost": bool, "reasoning": str, "bullets": [{date, text}]}.
 
         On any failure, returns shouldPost=False so the caller skips posting.
         """
+        empty = {"shouldPost": False, "reasoning": "", "bullets": []}
         if self._client is None:
             logger.error("ANTHROPIC_API_KEY not configured")
-            return {"shouldPost": False, "reasoning": "no_api_key", "bullet": ""}
+            return {**empty, "reasoning": "no_api_key"}
 
         try:
             response = self._client.messages.create(
@@ -130,18 +153,19 @@ class AnthropicClient:
             )
         except anthropic.APIError:
             logger.exception("Anthropic API call failed")
-            return {"shouldPost": False, "reasoning": "api_error", "bullet": ""}
+            return {**empty, "reasoning": "api_error"}
 
         try:
             text = next(b.text for b in response.content if b.type == "text")
             result = json.loads(text)
         except (StopIteration, json.JSONDecodeError):
             logger.exception("Could not parse Anthropic response")
-            return {"shouldPost": False, "reasoning": "parse_error", "bullet": ""}
+            return {**empty, "reasoning": "parse_error"}
 
         logger.info(
-            "AI decision: shouldPost=%s reasoning=%s",
+            "AI decision: shouldPost=%s bullets=%d reasoning=%s",
             result.get("shouldPost"),
+            len(result.get("bullets") or []),
             result.get("reasoning"),
         )
         return result

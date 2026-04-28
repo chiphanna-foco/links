@@ -127,7 +127,13 @@ async def api_check():
 
 
 @app.post("/api/check/{conversation_id}")
-async def api_check_one(conversation_id: str):
-    """Force-check a single parent conversation. Replaces Apps Script testConversation."""
-    result = await asyncio.to_thread(process_single_conversation, conversation_id, True)
+async def api_check_one(conversation_id: str, backfill: bool = False):
+    """Force-check a single parent conversation.
+
+    backfill=true ignores cache, looks back to when each link was added, and
+    REPLACES the section's bullets with a freshly-generated history.
+    """
+    result = await asyncio.to_thread(
+        process_single_conversation, conversation_id, True, backfill
+    )
     return result

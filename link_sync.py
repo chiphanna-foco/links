@@ -189,9 +189,9 @@ def _serialize_master_body(sections: list[dict]) -> str:
 
 
 def _upsert_section(
-    sections: list[dict], cnv_id: str, heading_text: str, dated_bullet: str
+    sections: list[dict], cnv_id: str, heading_text: str, dated_bullets: list[str]
 ) -> list[dict]:
-    """Append `dated_bullet` to the section for cnv_id (creating it if needed).
+    """Append `dated_bullets` to the section for cnv_id (creating it if needed).
 
     Also refreshes the heading text on existing sections so subject renames
     flow through. Mutates and returns `sections`.
@@ -199,17 +199,57 @@ def _upsert_section(
     for s in sections:
         if s["cnv_id"] == cnv_id:
             s["heading"] = heading_text
-            s["bullets"].append(dated_bullet)
+            s["bullets"].extend(dated_bullets)
             return sections
     sections.append(
-        {"cnv_id": cnv_id, "heading": heading_text, "bullets": [dated_bullet]}
+        {"cnv_id": cnv_id, "heading": heading_text, "bullets": list(dated_bullets)}
     )
     return sections
 
 
-def _format_dated_bullet(bullet: str, when: datetime) -> str:
-    local = when.astimezone(timezone.utc)
-    return f"{local.month}/{local.day} — {bullet}"
+def _replace_section(
+    sections: list[dict], cnv_id: str, heading_text: str, dated_bullets: list[str]
+) -> list[dict]:
+    """Replace the section's bullets entirely (for backfill). Creates if missing."""
+    for s in sections:
+        if s["cnv_id"] == cnv_id:
+            s["heading"] = heading_text
+            s["bullets"] = list(dated_bullets)
+            return sections
+    sections.append(
+        {"cnv_id": cnv_id, "heading": heading_text, "bullets": list(dated_bullets)}
+    )
+    return sections
+
+
+def _format_dated_bullet(text: str, date_str: str) -> str:
+    return f"{date_str} — {text}"
+
+
+def _build_dated_bullets(
+    bullets: list[dict], activity: list[dict]
+) -> list[str]:
+    """Convert Claude's [{date,text}, ...] into dated-bullet strings.
+
+    - Drops bullets whose date doesn't match any activity timestamp (anti-hallucination).
+    - Preserves Claude's order (which the prompt instructs to be chronological).
+    """
+    valid_dates = {
+        f"{a['timestamp'].month}/{a['timestamp'].day}"
+        for a in activity
+        if a.get("timestamp")
+    }
+    out: list[str] = []
+    for b in bullets:
+        date = (b.get("date") or "").strip()
+        text = (b.get("text") or "").strip()
+        if not date or not text:
+            continue
+        if date not in valid_dates:
+            logger.warning("Dropping bullet with invalid date %r: %r", date, text)
+            continue
+        out.append(_format_dated_bullet(text, date))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +261,18 @@ def process_conversation(
     claude: AnthropicClient,
     parent: dict,
     force: bool = False,
+    backfill: bool = False,
 ) -> tuple[int, int]:
-    """Process a single parent conversation. Returns (links_checked, bullets_added)."""
+    """Process a single parent conversation. Returns (links_checked, bullets_added).
+
+    backfill=True: ignore cache, look back to link_added_at, REPLACE each
+    section's bullets with a freshly-generated set covering full history.
+    """
     parent_id = parent["id"]
-    logger.info("Processing conversation %s", parent_id)
+    logger.info(
+        "Processing conversation %s (force=%s, backfill=%s)",
+        parent_id, force, backfill,
+    )
 
     comments = front.get_comments(parent_id)
     links = extract_links_from_comments(comments, self_id=parent_id)
@@ -257,18 +305,20 @@ def process_conversation(
         link_added_at = link["link_added_at"] or datetime.fromtimestamp(0, tz=timezone.utc)
         last_checked = get_last_checked(parent_id, linked_id)
 
-        # Match Apps Script: since = max(last_checked, link_added_at)
-        since = link_added_at
-        if last_checked and last_checked > since:
-            since = last_checked
-
-        if force:
-            two_h_ago = now - FORCE_LOOKBACK
-            if since < two_h_ago:
-                since = two_h_ago
-            logger.info("FORCE mode — checking %s since %s", linked_id, since.isoformat())
+        if backfill:
+            since = link_added_at
+            logger.info("BACKFILL %s since %s", linked_id, since.isoformat())
         else:
-            logger.info("Checking %s for activity since %s", linked_id, since.isoformat())
+            since = link_added_at
+            if last_checked and last_checked > since:
+                since = last_checked
+            if force:
+                two_h_ago = now - FORCE_LOOKBACK
+                if since < two_h_ago:
+                    since = two_h_ago
+                logger.info("FORCE mode — checking %s since %s", linked_id, since.isoformat())
+            else:
+                logger.info("Checking %s for activity since %s", linked_id, since.isoformat())
 
         links_checked += 1
 
@@ -293,7 +343,12 @@ def process_conversation(
         existing_section = next(
             (s for s in sections if s["cnv_id"] == linked_id), None
         )
-        previous_bullets = list(existing_section["bullets"]) if existing_section else []
+        # In backfill we regenerate from scratch, so don't bias Claude with
+        # bullets it would only re-derive.
+        previous_bullets = (
+            [] if backfill
+            else (list(existing_section["bullets"]) if existing_section else [])
+        )
 
         update_payload = [
             {
@@ -304,14 +359,18 @@ def process_conversation(
         ]
         result = claude.analyze_updates(update_payload, previous_bullets=previous_bullets)
 
-        if result.get("shouldPost") and result.get("bullet"):
-            latest = max(a["timestamp"] for a in activity)
-            dated = _format_dated_bullet(result["bullet"].strip(), latest)
-            _upsert_section(sections, linked_id, subject, dated)
-            bullets_added += 1
+        dated = _build_dated_bullets(result.get("bullets") or [], activity)
+        latest = max(a["timestamp"] for a in activity)
+
+        if result.get("shouldPost") and dated:
+            if backfill:
+                _replace_section(sections, linked_id, subject, dated)
+            else:
+                _upsert_section(sections, linked_id, subject, dated)
+            bullets_added += len(dated)
             pending_cache_updates.append((linked_id, latest, now))
         else:
-            logger.info("AI decided not to post for %s", linked_id)
+            logger.info("AI decided not to post for %s (bullets=%d)", linked_id, len(dated))
             pending_cache_updates.append((linked_id, now, None))
 
     if bullets_added > 0:
@@ -391,7 +450,9 @@ def check_linked_conversations(force: bool = False) -> dict:
     }
 
 
-def process_single_conversation(conversation_id: str, force: bool = True) -> dict:
+def process_single_conversation(
+    conversation_id: str, force: bool = True, backfill: bool = False
+) -> dict:
     """Test a single parent conversation (replaces Apps Script `testConversation`)."""
     front = FrontClient()
     claude = AnthropicClient()
@@ -404,7 +465,9 @@ def process_single_conversation(conversation_id: str, force: bool = True) -> dic
         return {"status": "error", "details": str(exc)}
 
     try:
-        links, posts = process_conversation(front, claude, parent, force=force)
+        links, posts = process_conversation(
+            front, claude, parent, force=force, backfill=backfill
+        )
     except Exception as exc:
         logger.exception("Failed processing %s", conversation_id)
         return {"status": "error", "details": str(exc)}
@@ -414,6 +477,7 @@ def process_single_conversation(conversation_id: str, force: bool = True) -> dic
         "status": "ok",
         "conversation_id": conversation_id,
         "links_checked": links,
-        "comments_posted": posts,
+        "bullets_added": posts,
+        "backfill": backfill,
         "duration_ms": duration_ms,
     }
