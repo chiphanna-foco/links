@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 2048
 MAX_BULLETS = 8
+SDK_OUTPUT_CONFIG = False  # Anthropic's structured-output validator rejects our nested-array schema; rely on prompt + json.loads instead.
 
 SYSTEM_PROMPT = (
     "You write extremely short status bullets for a property-management "
@@ -58,6 +59,30 @@ RESPONSE_SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+
+def _extract_json(text: str) -> str:
+    """Pull a JSON object out of Claude's response.
+
+    Without strict structured output, Claude sometimes wraps JSON in ```json
+    fences or adds a brief preamble. This finds the outermost {...}.
+    """
+    text = text.strip()
+    # Strip code fences
+    if text.startswith("```"):
+        # Remove first line (```json or ```) and trailing ```
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1 :]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    # Find outermost JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 
 def _format_activity_item(item: dict) -> list[str]:
@@ -138,29 +163,32 @@ class AnthropicClient:
             logger.error("ANTHROPIC_API_KEY not configured")
             return {**empty, "reasoning": "no_api_key"}
 
+        kwargs = dict(
+            model=self.model,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": _build_user_prompt(updates, previous_bullets or []),
+                }
+            ],
+        )
+        if SDK_OUTPUT_CONFIG:
+            kwargs["output_config"] = {"format": RESPONSE_SCHEMA}
+
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": _build_user_prompt(updates, previous_bullets or []),
-                    }
-                ],
-                output_config={"format": RESPONSE_SCHEMA},
-            )
-        except anthropic.APIError:
+            response = self._client.messages.create(**kwargs)
+        except anthropic.APIError as exc:
             logger.exception("Anthropic API call failed")
-            return {**empty, "reasoning": "api_error"}
+            return {**empty, "reasoning": f"api_error: {exc}"}
 
         try:
             text = next(b.text for b in response.content if b.type == "text")
-            result = json.loads(text)
-        except (StopIteration, json.JSONDecodeError):
+            result = json.loads(_extract_json(text))
+        except (StopIteration, json.JSONDecodeError) as exc:
             logger.exception("Could not parse Anthropic response")
-            return {**empty, "reasoning": "parse_error"}
+            return {**empty, "reasoning": f"parse_error: {exc}"}
 
         logger.info(
             "AI decision: shouldPost=%s bullets=%d reasoning=%s",
