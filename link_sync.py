@@ -24,6 +24,8 @@ from config import (
 from database import (
     cache_is_empty,
     get_known_links,
+    get_seen_parents,
+    mark_parent_seen,
     get_last_checked,
     get_state_float,
     record_sync_run,
@@ -327,6 +329,7 @@ def process_conversation(
     debug_info: list[dict] = []
     if not links:
         logger.info("No Front links found in comments for %s", parent_id)
+        mark_parent_seen(parent_id)
         return 0, 0, debug_info
 
     logger.info("Found %d linked conversation(s) for %s", len(links), parent_id)
@@ -493,6 +496,7 @@ def process_conversation(
     for linked_id, checked_at, posted_at in pending_cache_updates:
         upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
 
+    mark_parent_seen(parent_id)
     return links_checked, bullets_added, debug_info
 
 
@@ -556,6 +560,9 @@ def _select_parents(front: FrontClient, parents: list, force: bool) -> tuple:
         return parents, "full (events failed)", None, None
 
     known = get_known_links()
+    # Parents with no links never appear in `known`; without `seen` they would
+    # be re-fetched on every run forever.
+    seen = get_seen_parents() | set(known)
     selected = [
         p for p in parents
         if p.get("id") in active or (known.get(p.get("id"), set()) & active)
@@ -569,7 +576,7 @@ def _select_parents(front: FrontClient, parents: list, force: bool) -> tuple:
     cutoff = now - PARENT_ACTIVE_WINDOW_DAYS * 86400
     unseen, dormant = [], 0
     for p in parents:
-        if p.get("id") in known or p.get("id") in selected_ids:
+        if p.get("id") in seen or p.get("id") in selected_ids:
             continue
         touched = p.get("updated_at") or p.get("waiting_since")
         if touched and float(touched) < cutoff:
