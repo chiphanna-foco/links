@@ -12,6 +12,19 @@ LINKED_TAG_ID = os.getenv("LINKED_TAG_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 
+# -- Incremental sync --
+# The sweep used to walk every tagged conversation on every run. It now asks
+# Front's /events feed which conversations actually changed and looks only at
+# those. These bound the fallback to the old full sweep.
+EVENTS_ENABLED = os.getenv("EVENTS_ENABLED", "true").lower() == "true"
+# If our cursor is older than this, fall back to a full sweep rather than
+# paging a huge event backlog. Measured 2026-08-10 on this account: ~570
+# activity events/hour over ~38 pages, so 36h is roughly 1,400 pages.
+EVENTS_MAX_CURSOR_AGE_HOURS = int(os.getenv("EVENTS_MAX_CURSOR_AGE_HOURS", "36"))
+# On a cold start (empty cache — e.g. a redeploy without a volume) don't
+# re-derive a year of history for every link; clamp the lookback to this.
+COLD_START_LOOKBACK_HOURS = int(os.getenv("COLD_START_LOOKBACK_HOURS", "24"))
+
 # -- Scheduler --
 CHECK_INTERVAL_HOURS = int(os.getenv("CHECK_INTERVAL_HOURS", "6"))
 RUN_ON_STARTUP = os.getenv("RUN_ON_STARTUP", "false").lower() == "true"

@@ -8,6 +8,7 @@ POST /api/check/{conversation_id}       Force-check a single parent conversation
 """
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -21,8 +22,12 @@ from config import (
     RUN_ON_STARTUP,
     TIMEZONE,
 )
-from database import get_last_sync, init_db
-from link_sync import check_linked_conversations, process_single_conversation
+from database import get_last_sync, get_state_float, init_db
+from link_sync import (
+    EVENTS_CURSOR_KEY,
+    check_linked_conversations,
+    process_single_conversation,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,11 +135,20 @@ app = FastAPI(title="Front Link Sync", lifespan=lifespan)
 # Routes
 # ---------------------------------------------------------------------------
 
+def _cursor_age_hours():
+    """How stale the incremental cursor is; None means the next run is a full sweep."""
+    cursor = get_state_float(EVENTS_CURSOR_KEY)
+    if cursor is None:
+        return None
+    return round((time.time() - cursor) / 3600, 2)
+
+
 @app.get("/api/status")
 async def api_status():
     return {
         "status": "ok",
         "sweep_in_progress": _sync_running,
+        "events_cursor_age_hours": _cursor_age_hours(),
         "last_sync": get_last_sync(),
         "check_interval_hours": CHECK_INTERVAL_HOURS,
         "quiet_hours": {

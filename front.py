@@ -17,6 +17,10 @@ RATE_LIMIT_DEFAULT_WAIT = 10.0
 RATE_LIMIT_MAX_WAIT = 120.0
 
 
+class EventsTruncated(RuntimeError):
+    """The events feed had more pages than we allow — cursor is too far back."""
+
+
 def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
     """How long to wait before retrying, honouring Front's Retry-After header."""
     header = resp.headers.get("Retry-After")
@@ -73,6 +77,37 @@ class FrontClient:
             # After the first call, the `next` URL includes the cursor;
             # don't re-send original params.
             current_params = None
+
+    # ------------------------------------------------------------------ events
+
+    def get_events_since(
+        self, after_epoch: float, types: Optional[list] = None, max_pages: int = 1500
+    ) -> Iterator[dict]:
+        """Yield account events emitted after `after_epoch`.
+
+        Front rejects a float here with a 400, so the cursor is floored to an
+        int (verified against the live API 2026-08-10). Pages hold ~15 events;
+        this account emits ~570 activity events/hour, so `max_pages` caps a
+        runaway cursor at roughly 40 hours of history.
+        """
+        params = {"q[after]": int(after_epoch), "limit": 100}
+        if types:
+            params["q[types][]"] = types
+        url = f"{self.api_url}/events"
+        pages = 0
+        while url and pages < max_pages:
+            resp = self._get_with_backoff(url, params if pages == 0 else None)
+            data = resp.json()
+            pages += 1
+            for item in data.get("_results", []):
+                yield item
+            url = (data.get("_pagination") or {}).get("next")
+        if url:
+            logger.warning(
+                "DEGRADED: events feed still had pages after %d — cursor too old",
+                max_pages,
+            )
+            raise EventsTruncated(f"events feed exceeded {max_pages} pages")
 
     # ------------------------------------------------------------------ reads
 
