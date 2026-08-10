@@ -55,6 +55,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_link_sync_linked
                 ON link_sync_cache(linked_conversation_id);
 
+            -- A parent with no Front links in its comments produces no
+            -- link_sync_cache row, so without this it looks "never checked"
+            -- forever and gets re-fetched on every single run.
+            CREATE TABLE IF NOT EXISTS parent_seen (
+                parent_conversation_id TEXT PRIMARY KEY,
+                last_checked_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS sync_state (
                 key        TEXT PRIMARY KEY,
                 value      TEXT,
@@ -121,6 +129,26 @@ def upsert_last_checked(
                    updated_at      = CURRENT_TIMESTAMP""",
             (parent_id, linked_id, checked, posted),
         )
+
+
+def mark_parent_seen(parent_id: str):
+    """Record that we looked at this parent, links or not."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO parent_seen (parent_conversation_id) VALUES (?)
+               ON CONFLICT(parent_conversation_id) DO UPDATE SET
+                   last_checked_at = CURRENT_TIMESTAMP""",
+            (parent_id,),
+        )
+
+
+def get_seen_parents() -> set:
+    """Every parent we have ever looked at — including link-less ones."""
+    with get_db() as conn:
+        return {
+            row["parent_conversation_id"]
+            for row in conn.execute("SELECT parent_conversation_id FROM parent_seen")
+        }
 
 
 # ---------------------------------------------------------------------------
