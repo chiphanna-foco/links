@@ -22,12 +22,16 @@ from config import (
     LINKED_TAG_ID,
 )
 from database import (
+    FAILURE_SURFACE_THRESHOLD,
     cache_is_empty,
+    clear_link_failure,
     get_known_links,
+    get_persistent_failures,
     get_seen_parents,
     mark_parent_seen,
     get_last_checked,
     get_state_float,
+    record_link_failure,
     record_sync_run,
     set_state,
     upsert_last_checked,
@@ -404,9 +408,18 @@ def process_conversation(
 
         try:
             activity = get_activity_since(front, linked_id, since)
-        except Exception:
-            logger.exception("Failed to fetch activity for %s", linked_id)
+        except Exception as exc:
+            streak = record_link_failure(parent_id, linked_id, repr(exc))
+            if streak >= FAILURE_SURFACE_THRESHOLD:
+                logger.error(
+                    "PERSISTENT FAILURE: %s has failed %d runs in a row for "
+                    "parent %s — %s", linked_id, streak, parent_id, exc,
+                )
+            else:
+                logger.exception("Failed to fetch activity for %s", linked_id)
             continue
+
+        clear_link_failure(parent_id, linked_id)
 
         if not activity:
             logger.info("No new activity in %s", linked_id)
@@ -500,18 +513,38 @@ def process_conversation(
     return links_checked, bullets_added, debug_info
 
 
+def _is_our_own_comment(event: dict) -> bool:
+    """True for a `comment` event that is our own master-comment write.
+
+    Verified against the live API 2026-08-10: our posts appear as a `comment`
+    event whose `target.data.body` starts with our own MASTER_PREFIX/
+    COMMENT_PREFIX, posted by our token's own Front teammate identity. Without
+    this, every parent we write a summary to gets re-selected on the very next
+    cycle by our own write — the sweep chasing its own tail.
+    """
+    if event.get("type") != "comment":
+        return False
+    body = ((event.get("target") or {}).get("data") or {}).get("body") or ""
+    return body.startswith(MASTER_PREFIX) or body.startswith(COMMENT_PREFIX)
+
+
 def _active_conversation_ids(front: FrontClient, since_epoch: float) -> set:
     """Conversation ids Front says actually changed since `since_epoch`."""
     ids = set()
     count = 0
+    own_writes = 0
     for ev in front.get_events_since(since_epoch, ACTIVITY_EVENT_TYPES):
         count += 1
+        if _is_our_own_comment(ev):
+            own_writes += 1
+            continue
         convo = ev.get("conversation") or {}
         if convo.get("id"):
             ids.add(convo["id"])
     logger.info(
-        "Events feed: %d activity event(s) touching %d conversation(s) since %s",
-        count, len(ids),
+        "Events feed: %d activity event(s) (%d our own writes, excluded) "
+        "touching %d conversation(s) since %s",
+        count, own_writes, len(ids),
         datetime.fromtimestamp(since_epoch, tz=timezone.utc).isoformat(),
     )
     return ids
@@ -690,14 +723,30 @@ def check_linked_conversations(force: bool = False) -> dict:
     # leave it where it was so the next run re-covers the same window.
     set_state(EVENTS_CURSOR_KEY, str(run_started_epoch))
 
+    persistent = get_persistent_failures()
+    if persistent:
+        logger.error(
+            "%d link(s) have failed %d+ consecutive runs and are not "
+            "recovering on their own — %s",
+            len(persistent), FAILURE_SURFACE_THRESHOLD,
+            ", ".join(
+                f"{p['linked_conversation_id']} (parent {p['parent_conversation_id']}, "
+                f"{p['consecutive_failures']}x, last: {p['last_error'][:80]})"
+                for p in persistent[:10]
+            ),
+        )
+
     duration_ms = int((time.monotonic() - started) * 1000)
     record_sync_run(
         "success", len(selected), total_links, total_posts, duration_ms,
-        f"mode={mode}; {len(selected)}/{len(parents)} parents",
+        f"mode={mode}; {len(selected)}/{len(parents)} parents"
+        + (f"; {len(persistent)} persistent failure(s)" if persistent else ""),
     )
     logger.info(
-        "=== Run complete [%s]: %d of %d parents, %d links, %d posts in %d ms ===",
-        mode, len(selected), len(parents), total_links, total_posts, duration_ms,
+        "=== Run complete [%s]: %d of %d parents, %d links, %d posts, "
+        "%d persistent failure(s) in %d ms ===",
+        mode, len(selected), len(parents), total_links, total_posts,
+        len(persistent), duration_ms,
     )
     return {
         "status": "ok",
@@ -706,6 +755,7 @@ def check_linked_conversations(force: bool = False) -> dict:
         "parents_checked": len(selected),
         "links_checked": total_links,
         "comments_posted": total_posts,
+        "persistent_failures": len(persistent),
         "duration_ms": duration_ms,
     }
 

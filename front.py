@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_MAX_RETRIES = 5
 RATE_LIMIT_DEFAULT_WAIT = 10.0
 RATE_LIMIT_MAX_WAIT = 120.0
+RATE_LIMIT_MIN_WAIT = 1.0
 
 
 class EventsTruncated(RuntimeError):
@@ -22,13 +23,30 @@ class EventsTruncated(RuntimeError):
 
 
 def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
-    """How long to wait before retrying, honouring Front's Retry-After header."""
+    """How long to wait before retrying.
+
+    Front does not send Retry-After on its 429s (confirmed: 0 occurrences
+    across 114 live 429s on 2026-08-10). It does send X-RateLimit-Reset — a
+    unix timestamp for when the window clears — which is a real measurement
+    of the wait, unlike a guessed constant. Prefer that; only fall back to
+    exponential backoff when neither header is present.
+    """
     header = resp.headers.get("Retry-After")
     if header:
         try:
             return min(float(header), RATE_LIMIT_MAX_WAIT)
         except ValueError:
             pass
+
+    reset = resp.headers.get("X-RateLimit-Reset")
+    if reset:
+        try:
+            wait = float(reset) - time.time()
+            if wait > 0:
+                return min(max(wait, RATE_LIMIT_MIN_WAIT), RATE_LIMIT_MAX_WAIT)
+        except ValueError:
+            pass
+
     return min(RATE_LIMIT_DEFAULT_WAIT * (2 ** attempt), RATE_LIMIT_MAX_WAIT)
 
 
