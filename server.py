@@ -22,7 +22,7 @@ from config import (
     RUN_ON_STARTUP,
     TIMEZONE,
 )
-from database import get_last_sync, get_state_float, init_db
+from database import get_last_sync, get_persistent_failures, get_state_float, init_db
 from link_sync import (
     EVENTS_CURSOR_KEY,
     check_linked_conversations,
@@ -149,6 +149,7 @@ async def api_status():
         "status": "ok",
         "sweep_in_progress": _sync_running,
         "events_cursor_age_hours": _cursor_age_hours(),
+        "persistent_failures": len(get_persistent_failures()),
         "last_sync": get_last_sync(),
         "check_interval_hours": CHECK_INTERVAL_HOURS,
         "quiet_hours": {

@@ -69,6 +69,21 @@ def init_db():
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Before this, a link that errored (timeout, 403, whatever) just
+            -- got retried next run with no record it had ever failed. A link
+            -- that has been permanently broken for a year (cnv_dk9hvpl,
+            -- 403ing since 2025-08-10) looked identical in the logs to one
+            -- that failed once and recovered.
+            CREATE TABLE IF NOT EXISTS link_failures (
+                parent_conversation_id  TEXT NOT NULL,
+                linked_conversation_id  TEXT NOT NULL,
+                consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+                first_failed_at         TIMESTAMP,
+                last_failed_at          TIMESTAMP,
+                last_error              TEXT,
+                PRIMARY KEY (parent_conversation_id, linked_conversation_id)
+            );
+
             CREATE TABLE IF NOT EXISTS sync_log (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -149,6 +164,53 @@ def get_seen_parents() -> set:
             row["parent_conversation_id"]
             for row in conn.execute("SELECT parent_conversation_id FROM parent_seen")
         }
+
+
+FAILURE_SURFACE_THRESHOLD = 3
+
+
+def record_link_failure(parent_id: str, linked_id: str, error: str) -> int:
+    """Log a failure to fetch this link's activity. Returns the new streak."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO link_failures
+                   (parent_conversation_id, linked_conversation_id,
+                    consecutive_failures, first_failed_at, last_failed_at, last_error)
+               VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+               ON CONFLICT(parent_conversation_id, linked_conversation_id) DO UPDATE SET
+                   consecutive_failures = consecutive_failures + 1,
+                   last_failed_at       = CURRENT_TIMESTAMP,
+                   last_error           = excluded.last_error""",
+            (parent_id, linked_id, error[:500]),
+        )
+        row = conn.execute(
+            """SELECT consecutive_failures FROM link_failures
+               WHERE parent_conversation_id = ? AND linked_conversation_id = ?""",
+            (parent_id, linked_id),
+        ).fetchone()
+        return row["consecutive_failures"]
+
+
+def clear_link_failure(parent_id: str, linked_id: str):
+    """A link that succeeded is no longer failing — drop its streak."""
+    with get_db() as conn:
+        conn.execute(
+            """DELETE FROM link_failures
+               WHERE parent_conversation_id = ? AND linked_conversation_id = ?""",
+            (parent_id, linked_id),
+        )
+
+
+def get_persistent_failures(min_streak: int = FAILURE_SURFACE_THRESHOLD) -> list[dict]:
+    """Links that have failed min_streak+ runs in a row — worth a human's eyes."""
+    with get_db() as conn:
+        return [
+            dict(row) for row in conn.execute(
+                """SELECT * FROM link_failures WHERE consecutive_failures >= ?
+                   ORDER BY consecutive_failures DESC""",
+                (min_streak,),
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
