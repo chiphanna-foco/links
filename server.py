@@ -8,6 +8,7 @@ POST /api/check/{conversation_id}       Force-check a single parent conversation
 """
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -21,8 +22,12 @@ from config import (
     RUN_ON_STARTUP,
     TIMEZONE,
 )
-from database import get_last_sync, init_db
-from link_sync import check_linked_conversations, process_single_conversation
+from database import get_last_sync, get_state_float, init_db
+from link_sync import (
+    EVENTS_CURSOR_KEY,
+    check_linked_conversations,
+    process_single_conversation,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +35,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_sync_lock = asyncio.Lock()
+# A full sweep takes many hours, but /api/check is polled far more often than
+# that (a cron-job.org job hits it every 15 minutes). Queueing every trigger on
+# a lock built an unbounded backlog of sweeps that could never drain, kept the
+# process permanently busy, and made Front rate-limit us. Triggers that arrive
+# while a sweep is in flight are now dropped, not queued.
+#
+# Check-and-set is only atomic because every mutation happens on the event-loop
+# thread; the sweep itself runs in a worker thread via asyncio.to_thread.
+_sync_running = False
+
+
+def _try_begin_sync() -> bool:
+    """Claim the sweep slot. False if a sweep is already in flight."""
+    global _sync_running
+    if _sync_running:
+        return False
+    _sync_running = True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +83,12 @@ def _in_quiet_window() -> bool:
 # ---------------------------------------------------------------------------
 
 async def _run_sync(force: bool = False):
-    async with _sync_lock:
+    """Run one sweep. Caller must already hold the slot via _try_begin_sync()."""
+    global _sync_running
+    try:
         await asyncio.to_thread(check_linked_conversations, force)
+    finally:
+        _sync_running = False
 
 
 async def _link_check_scheduler():
@@ -75,6 +101,11 @@ async def _link_check_scheduler():
         await asyncio.sleep(interval)
         if _in_quiet_window():
             logger.info("In quiet window — skipping scheduled run")
+            continue
+        if not _try_begin_sync():
+            logger.warning(
+                "DEGRADED: scheduled run skipped — previous sweep still in progress"
+            )
             continue
         try:
             await _run_sync()
@@ -89,7 +120,7 @@ async def _link_check_scheduler():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    if RUN_ON_STARTUP and not _in_quiet_window():
+    if RUN_ON_STARTUP and not _in_quiet_window() and _try_begin_sync():
         logger.info("RUN_ON_STARTUP=true — kicking off initial sync")
         asyncio.create_task(_run_sync())
     task = asyncio.create_task(_link_check_scheduler())
@@ -104,10 +135,20 @@ app = FastAPI(title="Front Link Sync", lifespan=lifespan)
 # Routes
 # ---------------------------------------------------------------------------
 
+def _cursor_age_hours():
+    """How stale the incremental cursor is; None means the next run is a full sweep."""
+    cursor = get_state_float(EVENTS_CURSOR_KEY)
+    if cursor is None:
+        return None
+    return round((time.time() - cursor) / 3600, 2)
+
+
 @app.get("/api/status")
 async def api_status():
     return {
         "status": "ok",
+        "sweep_in_progress": _sync_running,
+        "events_cursor_age_hours": _cursor_age_hours(),
         "last_sync": get_last_sync(),
         "check_interval_hours": CHECK_INTERVAL_HOURS,
         "quiet_hours": {
@@ -121,9 +162,16 @@ async def api_status():
 
 @app.post("/api/check")
 async def api_check():
-    """Trigger a full sweep (ignores quiet window — manual runs always execute)."""
+    """Trigger a full sweep (ignores quiet window — manual runs always execute).
+
+    Returns 200 with `skipped: true` when a sweep is already running, so an
+    external cron sees a healthy service instead of piling work on it.
+    """
+    if not _try_begin_sync():
+        logger.info("Trigger ignored — sweep already in progress")
+        return {"status": "already running", "skipped": True}
     asyncio.create_task(_run_sync())
-    return {"status": "check started"}
+    return {"status": "check started", "skipped": False}
 
 
 @app.post("/api/check/{conversation_id}")

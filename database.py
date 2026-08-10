@@ -53,6 +53,12 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_link_sync_linked
                 ON link_sync_cache(linked_conversation_id);
 
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS sync_log (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -113,6 +119,60 @@ def upsert_last_checked(
                    updated_at      = CURRENT_TIMESTAMP""",
             (parent_id, linked_id, checked, posted),
         )
+
+
+# ---------------------------------------------------------------------------
+# Key/value sync state (events cursor, cold-start floor)
+# ---------------------------------------------------------------------------
+
+def get_state(key: str) -> Optional[str]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT value FROM sync_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+
+def set_state(key: str, value: str):
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO sync_state (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+            (key, value),
+        )
+
+
+def get_state_float(key: str) -> Optional[float]:
+    raw = get_state(key)
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        logger.warning("sync_state[%s] is not a number (%r) — ignoring", key, raw)
+        return None
+
+
+def cache_is_empty() -> bool:
+    """True when we have no watermarks at all — a fresh container or first run."""
+    with get_db() as conn:
+        row = conn.execute("SELECT 1 FROM link_sync_cache LIMIT 1").fetchone()
+        return row is None
+
+
+def get_known_links() -> dict:
+    """parent_conversation_id -> set(linked_conversation_id), from the cache.
+
+    Lets a run decide which parents are worth touching without spending an API
+    call per parent to re-read its comments.
+    """
+    out: dict = {}
+    with get_db() as conn:
+        for row in conn.execute(
+            "SELECT parent_conversation_id AS p, linked_conversation_id AS l "
+            "FROM link_sync_cache"
+        ):
+            out.setdefault(row["p"], set()).add(row["l"])
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -11,14 +11,23 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from config import LINKED_TAG_ID
+from config import (
+    COLD_START_LOOKBACK_HOURS,
+    EVENTS_ENABLED,
+    EVENTS_MAX_CURSOR_AGE_HOURS,
+    LINKED_TAG_ID,
+)
 from database import (
+    cache_is_empty,
+    get_known_links,
     get_last_checked,
+    get_state_float,
     record_sync_run,
+    set_state,
     upsert_last_checked,
 )
 from anthropic_client import AnthropicClient
-from front import FrontClient
+from front import EventsTruncated, FrontClient
 from html_utils import strip_html
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,13 @@ SECTION_HEADING_RE = re.compile(
     r"^### \[(?P<heading>.+?)\]\(https://app\.frontapp\.com/open/(?P<cnv_id>cnv_[a-zA-Z0-9]+)\)\s*$"
 )
 FORCE_LOOKBACK = timedelta(hours=2)
+
+EVENTS_CURSOR_KEY = "events_cursor"
+COLD_START_FLOOR_KEY = "cold_start_floor"
+
+# The only event types that can change what a summary should say: a message in
+# or out, or a teammate comment (which is also how a new link gets added).
+ACTIVITY_EVENT_TYPES = ["inbound", "outbound", "out_reply", "comment"]
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +303,8 @@ def process_conversation(
     force: bool = False,
     backfill: bool = False,
     debug: bool = False,
+    active_ids: Optional[set] = None,
+    window_start: Optional[float] = None,
 ) -> tuple[int, int, list[dict]]:
     """Process a single parent conversation. Returns (links_checked, bullets_added, debug_info).
 
@@ -324,8 +342,14 @@ def process_conversation(
 
     links_checked = 0
     bullets_added = 0
+    skipped_quiet = 0
     pending_cache_updates: list[tuple[str, datetime, Optional[datetime]]] = []
     now = datetime.now(tz=timezone.utc)
+
+    floor_epoch = get_state_float(COLD_START_FLOOR_KEY)
+    cold_start_floor = (
+        datetime.fromtimestamp(floor_epoch, tz=timezone.utc) if floor_epoch else None
+    )
 
     for link in links:
         linked_id = link["conversation_id"]
@@ -339,6 +363,15 @@ def process_conversation(
             since = link_added_at
             if last_checked and last_checked > since:
                 since = last_checked
+            elif last_checked is None and cold_start_floor and since < cold_start_floor:
+                # First time we have ever seen this pair AND we lost our cache.
+                # Without this clamp a redeploy re-summarizes every linked
+                # conversation from the day its link was added.
+                logger.info(
+                    "COLD START — clamping %s lookback from %s to %s",
+                    linked_id, since.isoformat(), cold_start_floor.isoformat(),
+                )
+                since = cold_start_floor
             if force:
                 two_h_ago = now - FORCE_LOOKBACK
                 if since < two_h_ago:
@@ -348,6 +381,19 @@ def process_conversation(
                 logger.info("Checking %s for activity since %s", linked_id, since.isoformat())
 
         links_checked += 1
+
+        # Front told us nothing happened in this conversation, and our window
+        # covers everything we care about, so there is no reason to page its
+        # whole message history just to discover that.
+        if (
+            active_ids is not None
+            and window_start is not None
+            and linked_id not in active_ids
+            and since.timestamp() >= window_start
+        ):
+            skipped_quiet += 1
+            pending_cache_updates.append((linked_id, now, None))
+            continue
 
         try:
             activity = get_activity_since(front, linked_id, since)
@@ -414,6 +460,12 @@ def process_conversation(
             logger.info("AI decided not to post for %s (bullets=%d)", linked_id, len(dated))
             pending_cache_updates.append((linked_id, now, None))
 
+    if skipped_quiet:
+        logger.info(
+            "Skipped %d quiet link(s) for %s — no events in the window",
+            skipped_quiet, parent_id,
+        )
+
     if bullets_added > 0:
         new_body = _serialize_master_body(sections)
         try:
@@ -438,6 +490,83 @@ def process_conversation(
         upsert_last_checked(parent_id, linked_id, checked_at, last_posted_at=posted_at)
 
     return links_checked, bullets_added, debug_info
+
+
+def _active_conversation_ids(front: FrontClient, since_epoch: float) -> set:
+    """Conversation ids Front says actually changed since `since_epoch`."""
+    ids = set()
+    count = 0
+    for ev in front.get_events_since(since_epoch, ACTIVITY_EVENT_TYPES):
+        count += 1
+        convo = ev.get("conversation") or {}
+        if convo.get("id"):
+            ids.add(convo["id"])
+    logger.info(
+        "Events feed: %d activity event(s) touching %d conversation(s) since %s",
+        count, len(ids),
+        datetime.fromtimestamp(since_epoch, tz=timezone.utc).isoformat(),
+    )
+    return ids
+
+
+def _select_parents(front: FrontClient, parents: list, force: bool) -> tuple:
+    """Narrow the work. Returns (parents, mode, active_ids, window_start).
+
+    `active_ids` is every conversation Front reports as changed since
+    `window_start`; both are None when we could not get a trustworthy answer,
+    which forces the old exhaustive behaviour.
+
+    Falls back to the full list — loudly — whenever the events feed can't be
+    trusted, so a degraded run is visible in the logs rather than silent.
+    """
+    now = time.time()
+
+    if force:
+        return parents, "full (force)", None, None
+    if not EVENTS_ENABLED:
+        logger.warning("DEGRADED: EVENTS_ENABLED=false — walking every conversation")
+        return parents, "full (events disabled)", None, None
+
+    cursor = get_state_float(EVENTS_CURSOR_KEY)
+    if cursor is None:
+        logger.warning(
+            "DEGRADED: no events cursor yet — one full sweep to establish it"
+        )
+        return parents, "full (no cursor)", None, None
+
+    age_h = (now - cursor) / 3600
+    if age_h > EVENTS_MAX_CURSOR_AGE_HOURS:
+        logger.warning(
+            "DEGRADED: events cursor is %.1fh old (limit %dh) — full sweep instead",
+            age_h, EVENTS_MAX_CURSOR_AGE_HOURS,
+        )
+        return parents, f"full (cursor {age_h:.1f}h old)", None, None
+
+    try:
+        active = _active_conversation_ids(front, cursor)
+    except EventsTruncated:
+        return parents, "full (events truncated)", None, None
+    except Exception:
+        logger.exception("DEGRADED: events feed unavailable — full sweep instead")
+        return parents, "full (events failed)", None, None
+
+    known = get_known_links()
+    selected = [
+        p for p in parents
+        if p.get("id") in active or (known.get(p.get("id"), set()) & active)
+    ]
+    # A parent we have never cached could hold links we know nothing about, so
+    # it has to be looked at at least once regardless of its event activity.
+    unseen = [p for p in parents if p.get("id") not in known and p not in selected]
+    if unseen:
+        logger.info("Including %d parent(s) never checked before", len(unseen))
+        selected.extend(unseen)
+
+    logger.info(
+        "Events fast path: %d of %d parent(s) had activity — skipping %d",
+        len(selected), len(parents), len(parents) - len(selected),
+    )
+    return selected, "incremental", active, cursor
 
 
 def check_linked_conversations(force: bool = False) -> dict:
@@ -466,25 +595,57 @@ def check_linked_conversations(force: bool = False) -> dict:
 
     logger.info("Found %d conversation(s) with Linked tag", len(parents))
 
+    # Claim the cursor BEFORE doing the work: anything that happens during this
+    # run must be picked up by the next one, not skipped as already-seen.
+    run_started_epoch = time.time()
+
+    if cache_is_empty() and get_state_float(COLD_START_FLOOR_KEY) is None:
+        floor = run_started_epoch - COLD_START_LOOKBACK_HOURS * 3600
+        set_state(COLD_START_FLOOR_KEY, str(floor))
+        # Seed the cursor to the same instant so the very first run can already
+        # skip the message history of links that saw no events in the window.
+        # Without this a cold start walks all ~17.6k links exhaustively.
+        set_state(EVENTS_CURSOR_KEY, str(floor))
+        logger.warning(
+            "DEGRADED: cold start with an empty cache — clamping first-time "
+            "lookback to %dh (from %s) instead of re-deriving all history",
+            COLD_START_LOOKBACK_HOURS,
+            datetime.fromtimestamp(floor, tz=timezone.utc).isoformat(),
+        )
+
+    selected, mode, active_ids, window_start = _select_parents(front, parents, force)
+
     total_links = 0
     total_posts = 0
-    for parent in parents:
+    for parent in selected:
         try:
-            links, posts, _ = process_conversation(front, claude, parent, force=force)
+            links, posts, _ = process_conversation(
+                front, claude, parent, force=force,
+                active_ids=active_ids, window_start=window_start,
+            )
             total_links += links
             total_posts += posts
         except Exception:
             logger.exception("Failed processing parent %s", parent.get("id"))
 
+    # Only advance the cursor after a run that actually finished; a crash must
+    # leave it where it was so the next run re-covers the same window.
+    set_state(EVENTS_CURSOR_KEY, str(run_started_epoch))
+
     duration_ms = int((time.monotonic() - started) * 1000)
-    record_sync_run("success", len(parents), total_links, total_posts, duration_ms)
+    record_sync_run(
+        "success", len(selected), total_links, total_posts, duration_ms,
+        f"mode={mode}; {len(selected)}/{len(parents)} parents",
+    )
     logger.info(
-        "=== Run complete: %d parents, %d links, %d posts in %d ms ===",
-        len(parents), total_links, total_posts, duration_ms,
+        "=== Run complete [%s]: %d of %d parents, %d links, %d posts in %d ms ===",
+        mode, len(selected), len(parents), total_links, total_posts, duration_ms,
     )
     return {
         "status": "ok",
-        "parents_checked": len(parents),
+        "mode": mode,
+        "parents_in_tag": len(parents),
+        "parents_checked": len(selected),
         "links_checked": total_links,
         "comments_posted": total_posts,
         "duration_ms": duration_ms,
