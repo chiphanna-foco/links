@@ -7,12 +7,16 @@ Conversation Updates` master comment on the parent.
 """
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import (
     COLD_START_LOOKBACK_HOURS,
+    PARENT_ACTIVE_WINDOW_DAYS,
+    SWEEP_CONCURRENCY,
     EVENTS_ENABLED,
     EVENTS_MAX_CURSOR_AGE_HOURS,
     LINKED_TAG_ID,
@@ -523,6 +527,7 @@ def _select_parents(front: FrontClient, parents: list, force: bool) -> tuple:
 
     if force:
         return parents, "full (force)", None, None
+
     if not EVENTS_ENABLED:
         logger.warning("DEGRADED: EVENTS_ENABLED=false — walking every conversation")
         return parents, "full (events disabled)", None, None
@@ -555,12 +560,34 @@ def _select_parents(front: FrontClient, parents: list, force: bool) -> tuple:
         p for p in parents
         if p.get("id") in active or (known.get(p.get("id"), set()) & active)
     ]
+    selected_ids = {p.get("id") for p in selected}
+
     # A parent we have never cached could hold links we know nothing about, so
-    # it has to be looked at at least once regardless of its event activity.
-    unseen = [p for p in parents if p.get("id") not in known and p not in selected]
+    # it needs looking at once — but only if it has been touched recently.
+    # A dormant conversation stays skipped until an event wakes it, at which
+    # point the branch above picks it up regardless of how old it is.
+    cutoff = now - PARENT_ACTIVE_WINDOW_DAYS * 86400
+    unseen, dormant = [], 0
+    for p in parents:
+        if p.get("id") in known or p.get("id") in selected_ids:
+            continue
+        touched = p.get("updated_at") or p.get("waiting_since")
+        if touched and float(touched) < cutoff:
+            dormant += 1
+            continue
+        unseen.append(p)
     if unseen:
-        logger.info("Including %d parent(s) never checked before", len(unseen))
-        selected.extend(unseen)
+        logger.info(
+            "Including %d parent(s) never checked before (within %dd)",
+            len(unseen), PARENT_ACTIVE_WINDOW_DAYS,
+        )
+    if dormant:
+        logger.info(
+            "Skipping %d dormant parent(s) untouched for over %dd — an event "
+            "still wakes any of them",
+            dormant, PARENT_ACTIVE_WINDOW_DAYS,
+        )
+    selected.extend(unseen)
 
     logger.info(
         "Events fast path: %d of %d parent(s) had activity — skipping %d",
@@ -617,16 +644,40 @@ def check_linked_conversations(force: bool = False) -> dict:
 
     total_links = 0
     total_posts = 0
-    for parent in selected:
+    counter_lock = threading.Lock()
+    done = [0]
+
+    def _one(parent):
+        # Each worker gets its own clients: requests.Session and the Anthropic
+        # client are not guaranteed safe to share across threads.
+        f = FrontClient()
+        c = AnthropicClient()
         try:
             links, posts, _ = process_conversation(
-                front, claude, parent, force=force,
+                f, c, parent, force=force,
                 active_ids=active_ids, window_start=window_start,
             )
-            total_links += links
-            total_posts += posts
         except Exception:
             logger.exception("Failed processing parent %s", parent.get("id"))
+            return 0, 0
+        return links, posts
+
+    logger.info(
+        "Processing %d parent(s) with %d worker(s)", len(selected), SWEEP_CONCURRENCY
+    )
+    with ThreadPoolExecutor(max_workers=SWEEP_CONCURRENCY) as pool:
+        futures = {pool.submit(_one, p): p for p in selected}
+        for fut in as_completed(futures):
+            links, posts = fut.result()
+            with counter_lock:
+                total_links += links
+                total_posts += posts
+                done[0] += 1
+                if done[0] % 250 == 0:
+                    logger.info(
+                        "Progress: %d/%d parents, %d links, %d posts",
+                        done[0], len(selected), total_links, total_posts,
+                    )
 
     # Only advance the cursor after a run that actually finished; a crash must
     # leave it where it was so the next run re-covers the same window.
