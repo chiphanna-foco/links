@@ -10,7 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
+    # timeout: with SWEEP_CONCURRENCY workers writing watermarks, a writer must
+    # wait for the lock rather than raise "database is locked" and lose the row.
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

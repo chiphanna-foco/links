@@ -21,6 +21,16 @@ EVENTS_ENABLED = os.getenv("EVENTS_ENABLED", "true").lower() == "true"
 # paging a huge event backlog. Measured 2026-08-10 on this account: ~570
 # activity events/hour over ~38 pages, so 36h is roughly 1,400 pages.
 EVENTS_MAX_CURSOR_AGE_HOURS = int(os.getenv("EVENTS_MAX_CURSOR_AGE_HOURS", "36"))
+# Only conversations touched inside this window are worth backfilling. Dormant
+# ones stay skipped until an event wakes them, however old they are. Measured
+# 2026-08-10: 6,684 of 12,157 tagged conversations (55%) fall inside 30 days.
+PARENT_ACTIVE_WINDOW_DAYS = int(os.getenv("PARENT_ACTIVE_WINDOW_DAYS", "30"))
+
+# Parents are independent of each other, so they can be worked concurrently.
+# The ceiling is Front's 200 req/min, not CPU: a single worker was measured
+# using only ~15% of that budget.
+SWEEP_CONCURRENCY = int(os.getenv("SWEEP_CONCURRENCY", "6"))
+
 # On a cold start (empty cache — e.g. a redeploy without a volume) don't
 # re-derive a year of history for every link; clamp the lookback to this.
 COLD_START_LOOKBACK_HOURS = int(os.getenv("COLD_START_LOOKBACK_HOURS", "24"))
