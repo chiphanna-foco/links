@@ -38,7 +38,7 @@ from database import (
 )
 from anthropic_client import AnthropicClient
 from front import EventsTruncated, FrontClient
-from html_utils import strip_html
+from html_utils import strip_quoted_html
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def get_activity_since(
                 "timestamp": created,
                 "author": _author_name(m),
                 "subject": m.get("subject"),
-                "body": strip_html(body)[:2000],
+                "body": strip_quoted_html(body)[:2000],
                 "is_inbound": m.get("is_inbound"),
             }
         )

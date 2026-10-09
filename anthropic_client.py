@@ -1,6 +1,6 @@
 """Anthropic client — analyzes linked-conversation updates and returns a JSON decision.
 
-Uses Claude Haiku 4.5 via the official Anthropic Python SDK with structured
+Uses Claude Haiku 5.5 via the official Anthropic Python SDK with structured
 outputs for guaranteed-valid JSON responses.
 """
 import json
@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 MAX_TOKENS = 2048
 MAX_BULLETS = 8
 SDK_OUTPUT_CONFIG = False  # Anthropic's structured-output validator rejects our nested-array schema; rely on prompt + json.loads instead.
+
+# Haiku 5.x turns adaptive thinking on by default. This is a short-summary job
+# that never needed it (and ran on Haiku 4.5 without it), so switch it off to
+# keep output tokens and behaviour as they were.
+THINKING_OFF = {"type": "disabled"}
+
+
+def _model_supports_thinking_param(model: str) -> bool:
+    return (model or "").startswith("claude-haiku-5")
+
 
 SYSTEM_PROMPT = (
     "You write extremely short status bullets for a property-management "
@@ -121,24 +131,53 @@ def _format_context(updates: list[dict], previous_bullets: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _build_user_prompt(updates: list[dict], previous_bullets: list[str]) -> str:
-    context = _format_context(updates, previous_bullets)
-    return f"""{context}
-
-TASK: Produce up to {MAX_BULLETS} short bullets capturing the distinct decision-relevant beats of this thread.
+# Everything below is identical on every call, so it lives in the system prompt
+# where it can be prompt-cached. Only the per-call activity goes in the user
+# message. Do not interpolate anything per-call (dates, ids, subjects) into
+# this text: a single changed byte invalidates the cache.
+TASK_INSTRUCTIONS = f"""TASK: Produce up to {MAX_BULLETS} short bullets capturing the distinct decision-relevant beats of this thread.
 
 Rules:
 - Each bullet covers ONE distinct event or milestone (vendor scheduled, bid received, owner approval, follow-up sent, etc.).
 - Hard cap 80 characters per bullet text; aim 30-60.
 - Do NOT restate the conversation subject or property — the heading already shows it.
 - Lead with the actor (Owner, Vendor, Manager, Tenant) or the action.
-- The "date" field MUST be in M/D format and MUST match an actual activity date shown above (in the [M/D] tags). Do not invent dates.
+- The "date" field MUST be in M/D format and MUST match an actual activity date shown in the user message (in the [M/D] tags). Do not invent dates.
 - One sentence per bullet, no leading dash or date inside the text.
 - Order bullets chronologically (oldest first).
-- Skip insignificant pings, automated bounces, and anything already covered by the "already logged" bullets above.
+- Skip insignificant pings, automated bounces, and anything already covered by the "already logged" bullets in the user message.
 - If nothing new is worth posting, return shouldPost=false and bullets=[].
 
 Output JSON: {{"shouldPost": bool, "reasoning": str, "bullets": [{{"date": "M/D", "text": str}}, ...]}}"""
+
+SYSTEM_BLOCKS = [
+    {"type": "text", "text": SYSTEM_PROMPT},
+    # Breakpoint on the last static block caches the whole system prefix.
+    {
+        "type": "text",
+        "text": TASK_INSTRUCTIONS,
+        "cache_control": {"type": "ephemeral"},
+    },
+]
+
+
+def _build_user_prompt(updates: list[dict], previous_bullets: list[str]) -> str:
+    return _format_context(updates, previous_bullets)
+
+
+def _log_usage(response) -> None:
+    """One INFO line per call so cache hits are visible in the deploy logs."""
+    u = getattr(response, "usage", None)
+    if u is None:
+        return
+    logger.info(
+        "Anthropic usage: model=%s input=%s output=%s cache_read=%s cache_creation=%s",
+        getattr(response, "model", "?"),
+        getattr(u, "input_tokens", None),
+        getattr(u, "output_tokens", None),
+        getattr(u, "cache_read_input_tokens", None),
+        getattr(u, "cache_creation_input_tokens", None),
+    )
 
 
 class AnthropicClient:
@@ -166,7 +205,7 @@ class AnthropicClient:
         kwargs = dict(
             model=self.model,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_BLOCKS,
             messages=[
                 {
                     "role": "user",
@@ -174,6 +213,8 @@ class AnthropicClient:
                 }
             ],
         )
+        if _model_supports_thinking_param(self.model):
+            kwargs["thinking"] = THINKING_OFF
         if SDK_OUTPUT_CONFIG:
             kwargs["output_config"] = {"format": RESPONSE_SCHEMA}
 
@@ -182,6 +223,8 @@ class AnthropicClient:
         except anthropic.APIError as exc:
             logger.exception("Anthropic API call failed")
             return {**empty, "reasoning": f"api_error: {exc}"}
+
+        _log_usage(response)
 
         try:
             text = next(b.text for b in response.content if b.type == "text")
