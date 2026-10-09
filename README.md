@@ -59,7 +59,7 @@ docker compose up --build
 | `FRONT_API_URL` | | `https://api2.frontapp.com` | Front API base URL |
 | `LINKED_TAG_ID` | ✅ | — | Front tag ID for "Linked" (e.g. `tag_27f7wp`) |
 | `ANTHROPIC_API_KEY` | ✅ | — | Anthropic API key |
-| `ANTHROPIC_MODEL` | | `claude-haiku-4-5` | Model used for summarization |
+| `ANTHROPIC_MODEL` | | `claude-haiku-5-5` | Model used for summarization |
 | `CHECK_INTERVAL_HOURS` | | `6` | How often the scheduler fires |
 | `RUN_ON_STARTUP` | | `false` | Run a check immediately when the server starts |
 | `QUIET_HOURS_START` | | `23` | Quiet window start hour (0-23) |
@@ -84,7 +84,7 @@ On every run:
 1. Fetch every conversation tagged `LINKED_TAG_ID`.
 2. For each, scan comments for `https://app.frontapp.com/open/cnv_…` links.
 3. For each referenced conversation, collect messages + comments created since `max(last_checked_at, link_added_at)`.
-4. Send the activity to Claude (Haiku 4.5 via structured outputs). It returns `{shouldPost, reasoning, message}`.
+4. Send the activity to Claude (Haiku 5.5, thinking disabled, static instructions prompt-cached). It returns `{shouldPost, reasoning, message}`.
 5. If `shouldPost`, post an internal comment prefixed with `🔗 **Linked Conversation Update**` on the parent conversation, and advance the cache to the latest reported timestamp.
 
 The scheduler skips runs whose current local hour falls inside `[QUIET_HOURS_START, QUIET_HOURS_END)`. Manual endpoint calls ignore the quiet window.

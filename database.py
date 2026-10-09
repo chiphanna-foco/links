@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -37,6 +38,13 @@ def get_db():
 # ---------------------------------------------------------------------------
 
 def init_db():
+    if not os.path.abspath(DATABASE_PATH).startswith("/data/"):
+        logger.warning(
+            "DATABASE_PATH=%s is NOT on the /data volume — the cache is wiped on "
+            "every redeploy and the next sweep re-sends activity to Claude; mount "
+            "a Railway volume at /data",
+            DATABASE_PATH,
+        )
     with get_db() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS link_sync_cache (

@@ -10,7 +10,7 @@ LINKED_TAG_ID = os.getenv("LINKED_TAG_ID", "")
 
 # -- Anthropic --
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
 
 # -- Incremental sync --
 # The sweep used to walk every tagged conversation on every run. It now asks
